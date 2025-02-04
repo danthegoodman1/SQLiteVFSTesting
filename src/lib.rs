@@ -34,7 +34,7 @@ struct VFSState<T: VFS + Sized> {
 /// Because SQLite allocates this initially, the ext might not exist, so we use a MaybeUninit.
 struct FileState<T: VFS + Sized> {
     base: libsqlite3_sys::sqlite3_file,
-    ext: MaybeUninit<T>, // TODO: I think this needs to be a "file-specific" pointer, even if just a thin proxy for referencing the VFS again through an Arc
+    ext: MaybeUninit<Arc<VFSState<T>>>, // TODO: I think this needs to be a "file-specific" pointer, even if just a thin proxy for referencing the VFS again through an Arc
 }
 
 impl<T: VFS + Sized> VFSState<T> {
@@ -52,9 +52,9 @@ fn null_ptr_error() -> std::io::Error {
 
 unsafe fn vfs_state<'a, V: VFS + Sync + Sized>(
     ptr: *mut libsqlite3_sys::sqlite3_vfs,
-) -> Result<&'a mut VFSState<V>, std::io::Error> {
+) -> Result<&'a mut Arc<VFSState<V>>, std::io::Error> {
     let vfs: &mut libsqlite3_sys::sqlite3_vfs = ptr.as_mut().ok_or_else(null_ptr_error)?;
-    let state = (vfs.pAppData as *mut VFSState<V>)
+    let state = (vfs.pAppData as *mut Arc<VFSState<V>>)
         .as_mut()
         .ok_or_else(null_ptr_error)?;
     Ok(state)
@@ -62,7 +62,7 @@ unsafe fn vfs_state<'a, V: VFS + Sync + Sized>(
 
 unsafe fn file_state<'a, V: VFS + Sync + Sized>(
     ptr: *mut libsqlite3_sys::sqlite3_file,
-) -> Result<&'a mut V, std::io::Error> {
+) -> Result<&'a mut Arc<VFSState<V>>, std::io::Error> {
     let f = (ptr as *mut FileState<V>)
         .as_mut()
         .ok_or_else(null_ptr_error)?;
@@ -131,29 +131,28 @@ pub fn register<T: VFS + Sync + Sized>(
         xFetch: None,
         xUnfetch: None,
     };
-    let name = CString::new(name)?;
-    let name_ptr = name.as_ptr();
-    let ptr = Box::into_raw(Box::new(VFSState {
-        //   name,
+
+    // Leak the VFS name so its memory remains valid.
+    let name_ptr = CString::new(name)?.into_raw();
+
+    // Create and box an Arc<VFSState<T>>
+    let state = Arc::new(VFSState {
         vfs: Arc::new(vfs),
         last_error: Arc::new(Mutex::new(None)),
-        //   #[cfg(any(feature = "syscall", feature = "loadext"))]
-        //   parent_vfs: unsafe { ffi::sqlite3_vfs_find(std::ptr::null_mut()) },
-        //   io_methods,
-        //   last_error: Default::default(),
-        //   next_id: 0,
-    }));
+    });
+    let ptr = Box::into_raw(Box::new(state));
+
     let vfs = Box::into_raw(Box::new(libsqlite3_sys::sqlite3_vfs {
         #[cfg(not(feature = "syscall"))]
         iVersion: 2,
         #[cfg(feature = "syscall")]
         iVersion: 3,
-        szOsFile: size_of::<VFSState<T>>() as i32,
-        mxPathname: 512 as i32, // max path length supported by VFS
+        szOsFile: std::mem::size_of::<FileState<T>>() as i32,
+        mxPathname: 512 as i32,
         pNext: null_mut(),
         zName: name_ptr,
         pAppData: ptr as _,
-        xOpen: Some(vfs::open::<T>),
+        xOpen: Some(vfs::x_open::<T>),
         xDelete: None,
         xAccess: None,
         xFullPathname: None,
@@ -166,14 +165,12 @@ pub fn register<T: VFS + Sync + Sized>(
         xCurrentTime: None,
         xGetLastError: None,
         xCurrentTimeInt64: None,
-
         #[cfg(not(feature = "syscall"))]
         xSetSystemCall: None,
         #[cfg(not(feature = "syscall"))]
         xGetSystemCall: None,
         #[cfg(not(feature = "syscall"))]
         xNextSystemCall: None,
-
         #[cfg(feature = "syscall")]
         xSetSystemCall: Some(vfs::set_system_call::<V>),
         #[cfg(feature = "syscall")]
@@ -187,7 +184,64 @@ pub fn register<T: VFS + Sync + Sized>(
         return Err(RegisterError::Register(result));
     }
 
-    // TODO: return object that allows to unregister (and cleanup the memory)?
-
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{register, VFS};
+    use rusqlite::{Connection, OpenFlags};
+    use std::{ffi::CString, fs};
+
+    // A simple dummy VFS implementation just for testing.
+    struct DummyVFS;
+
+    impl VFS for DummyVFS {
+        fn x_open(&self) {
+            // This is just for demonstration.
+            println!("DummyVFS::x_open was called");
+        }
+    }
+
+    #[test]
+    fn test_vfs_x_open_logging() {
+        // Choose a unique name for your custom VFS. This must match when opening the connection.
+        let vfs_name = "dummyvfs";
+
+        // Register your dummy VFS.
+        // (Any error here means the registration failed. In a real test you might want to tear down the file afterwards.)
+        register(vfs_name, true, DummyVFS).expect("failed to register dummy VFS");
+
+        // Check that the VFS is registered
+        let found_vfs = unsafe {
+            let c_vfs_name = CString::new(vfs_name).unwrap();
+            libsqlite3_sys::sqlite3_vfs_find(c_vfs_name.as_ptr())
+        };
+        if found_vfs.is_null() {
+            println!("VFS {} is not registered!", vfs_name);
+        } else {
+            println!("VFS {} registered: {:?}", vfs_name, found_vfs);
+        }
+
+        // Open a SQLite connection using your custom VFS by passing its name.
+        // Note: Instead of using ":memory:" you might want to use a file so that SQLite calls x_open.
+        let db_path = "dummy.db";
+        // Remove any previous file.
+        let _ = fs::remove_file(db_path);
+        let conn = Connection::open_with_flags_and_vfs(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+            vfs_name,
+        )
+        .expect("failed to open connection with dummy VFS");
+
+        // Use the connection so that SQLite will perform file I/O and trigger x_open.
+        conn.execute("CREATE TABLE test (id INTEGER)", [])
+            .expect("failed to create table");
+
+        // When running tests with `cargo test -- --nocapture` you should see the
+        // output from the println! inside x_open (and from DummyVFS::x_open if called).
+        drop(conn);
+        let _ = fs::remove_file(db_path);
+    }
 }
