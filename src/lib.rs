@@ -25,19 +25,19 @@ pub trait VFS {
     fn x_open(&self);
 }
 
-struct VFSState<T: VFS> {
+struct VFSState<T: VFS + Sized> {
     vfs: Arc<T>,
     last_error: Arc<Mutex<Option<(i32, std::io::Error)>>>, // sqlite error, rust error
 }
 
 /// FileState is a wrapper around the sqlite3_file struct that contains the VFS state.
 /// Because SQLite allocates this initially, the ext might not exist, so we use a MaybeUninit.
-struct FileState<T: VFS> {
+struct FileState<T: VFS + Sized> {
     base: libsqlite3_sys::sqlite3_file,
     ext: MaybeUninit<T>, // TODO: I think this needs to be a "file-specific" pointer, even if just a thin proxy for referencing the VFS again through an Arc
 }
 
-impl<T: VFS> VFSState<T> {
+impl<T: VFS + Sized> VFSState<T> {
     /// Set the last error for the VFS. Returns the error code for convenience so it can be retured.
     fn set_last_error(&self, code: i32, error: std::io::Error) -> i32 {
         debug!("setting last error: {:?}, {:?}", code, error);
@@ -50,7 +50,7 @@ fn null_ptr_error() -> std::io::Error {
     std::io::Error::new(ErrorKind::Other, "received null pointer")
 }
 
-unsafe fn vfs_state<'a, V: VFS + Sync>(
+unsafe fn vfs_state<'a, V: VFS + Sync + Sized>(
     ptr: *mut libsqlite3_sys::sqlite3_vfs,
 ) -> Result<&'a mut VFSState<V>, std::io::Error> {
     let vfs: &mut libsqlite3_sys::sqlite3_vfs = ptr.as_mut().ok_or_else(null_ptr_error)?;
@@ -60,7 +60,7 @@ unsafe fn vfs_state<'a, V: VFS + Sync>(
     Ok(state)
 }
 
-unsafe fn file_state<'a, V: VFS + Sync>(
+unsafe fn file_state<'a, V: VFS + Sync + Sized>(
     ptr: *mut libsqlite3_sys::sqlite3_file,
 ) -> Result<&'a mut V, std::io::Error> {
     let f = (ptr as *mut FileState<V>)
@@ -102,63 +102,14 @@ impl From<std::ffi::NulError> for RegisterError {
     }
 }
 
-unsafe extern "C" fn x_close(arg1: *mut libsqlite3_sys::sqlite3_file) -> ::std::os::raw::c_int {
-    println!("closing with arg: {:?}", arg1);
-    libsqlite3_sys::SQLITE_OK
-}
-
-unsafe extern "C" fn x_open<V: VFS + Sync>(
-    arg1: *mut libsqlite3_sys::sqlite3_vfs,
-    zName: *const ::std::os::raw::c_char,
-    arg2: *mut libsqlite3_sys::sqlite3_file,
-    flags: ::std::os::raw::c_int,
-    pOutFlags: *mut ::std::os::raw::c_int,
-) -> ::std::os::raw::c_int {
-    println!(
-        "opening with args: {:?}, {:?}, {:?}, {:?}, {:?}",
-        arg1, zName, arg2, flags, pOutFlags
-    );
-
-    let state = match vfs_state::<V>(arg1) {
-        Ok(state) => state,
-        Err(_) => return libsqlite3_sys::SQLITE_ERROR,
-    };
-
-    let out_file = match (arg2 as *mut FileState<V>).as_mut() {
-        Some(f) => f,
-        None => {
-            return state.set_last_error(
-                libsqlite3_sys::SQLITE_CANTOPEN,
-                std::io::Error::new(ErrorKind::Other, "invalid file pointer"),
-            );
-        }
-    };
-    // out_file.base.pMethods = &state.io_methods;
-    out_file.ext.write(FileExt {
-        vfs: state.vfs.clone(),
-        vfs_name: state.name.clone(),
-        db_name: name,
-        file,
-        delete_on_close: opts.delete_on_close,
-        last_error: Arc::clone(&state.last_error),
-        last_errno: 0,
-        wal_index: None,
-        wal_index_regions: Default::default(),
-        wal_index_locks: Default::default(),
-        has_exclusive_lock: false,
-        id: state.next_id,
-        chunk_size: None,
-        persist_wal: false,
-        powersafe_overwrite,
-    });
-
-    libsqlite3_sys::SQLITE_OK
-}
-
 mod io_methods;
 mod vfs;
 
-pub fn register<T: VFS + Sync>(name: &str, as_default: bool, vfs: T) -> Result<(), RegisterError> {
+pub fn register<T: VFS + Sync + Sized>(
+    name: &str,
+    as_default: bool,
+    vfs: T,
+) -> Result<(), RegisterError> {
     let io_methods = libsqlite3_sys::sqlite3_io_methods {
         iVersion: 2,
         xClose: Some(io_methods::x_close),
@@ -185,6 +136,7 @@ pub fn register<T: VFS + Sync>(name: &str, as_default: bool, vfs: T) -> Result<(
     let ptr = Box::into_raw(Box::new(VFSState {
         //   name,
         vfs: Arc::new(vfs),
+        last_error: Arc::new(Mutex::new(None)),
         //   #[cfg(any(feature = "syscall", feature = "loadext"))]
         //   parent_vfs: unsafe { ffi::sqlite3_vfs_find(std::ptr::null_mut()) },
         //   io_methods,
